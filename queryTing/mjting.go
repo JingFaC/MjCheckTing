@@ -1,6 +1,7 @@
 package mjchecker
 
 import (
+	"fmt"
 	"github.com/go-redis/redis"
 	"gitlab.bianfeng.com/gdmj/gameserver/config"
 	"gitlab.bianfeng.com/gdmj/gameserver/library/nredis"
@@ -11,27 +12,51 @@ import (
 
 // 查询当前手牌听牌列表
 type MJTing struct {
-	ghostNum        int                      // 鬼牌数量
-	noGhostMulti    int                      // 无鬼加倍
-	category        int                      //玩法
-	ghostList       []int                    // 列表
-	handCards       []int                    // 真正的手牌没有副露
-	checkCards      []int                    // 查听的牌包括手牌和副露
-	fuuroList       []int                    // 副露list
-	redisClient     *redis.Client            // redisConn
-	supportFanList  *config.SupportedFanList // 支持胡的番型
-	ruleConfig      *game.HomeConfigItem     // 玩法
-	FourGhostWinMap map[int]int              // 四鬼胡牌听牌信息
-	NormalResultMap map[int]map[int]int      // 听牌查询结果
+	// 鬼牌数量
+	ghostNum int
+
+	// 无鬼加倍
+	noGhostMulti int
+
+	// 玩法
+	category int
+
+	// 房间类型
+	homeType int
+
+	// 鬼牌1
+	ghostTips1 int
+
+	// 鬼牌2
+	ghostTips2 int
+
+	// 四鬼胡牌听牌信息
+	FourGhostWinPoint int
+
+	// 真正的手牌不包括副露和鬼牌
+	handCards []int
+
+	// 副露list
+	fuuroList []int
+
+	// 规则配置
+	ruleConfig *game.HomeConfigItem
+
+	// 支持胡的番型
+	supportFanList *config.SupportedFanList
+
+	// 表格redis
+	redisClient *redis.Client
+
+	// 听牌查询结果
+	NormalResultMap map[int]map[int]int
 }
 
-func (mj *MJTing) Init(handCards, fuuroCards, ghost []int, ruleConfig *game.HomeConfigItem, category int, supportFanList *config.SupportedFanList) {
+func (mj *MJTing) Init(handCards, fuuroCards, ghost []int) {
 	mj.Reset()
-	mj.ghostList = ghost
-	mj.supportFanList = supportFanList
-	mj.ruleConfig = ruleConfig
 	mj.fuuroList = fuuroCards
-	mj.category = category
+
+	mj.setGhost(ghost)
 	mj.setHandCards(handCards)
 	mj.setFourGhostWinTing()
 	mj.setNoGhostMulti()
@@ -41,26 +66,38 @@ func (mj *MJTing) Reset() {
 	mj.ghostNum = 0
 	mj.noGhostMulti = 1
 	mj.category = 0
-	mj.ghostList = make([]int, 0)
-	mj.checkCards = make([]int, 0)
+	mj.homeType = 0
 	mj.redisClient = nredis.GetTblClient()
 	mj.NormalResultMap = make(map[int]map[int]int)
-	mj.FourGhostWinMap = make(map[int]int)
+	mj.FourGhostWinPoint = 0
 }
 
-func (mj *MJTing) isGhost(cid int) bool {
-	for _, ghostCid := range mj.ghostList {
-		if ghostCid != 0 && cid == ghostCid {
-			return true
-		}
+func (mj *MJTing) SetTingConfig(ruleConfig *game.HomeConfigItem, category int, supportFanList *config.SupportedFanList, homeType int) {
+	mj.supportFanList = supportFanList
+	mj.ruleConfig = ruleConfig
+	mj.category = category
+	mj.homeType = homeType
+}
+
+func (mj *MJTing) setGhost(ghost []int) {
+	ghostNum := len(ghost)
+	if ghostNum == 1 {
+		mj.ghostTips1 = ghost[0]
+	} else if ghostNum == 2 {
+		mj.ghostTips1 = ghost[0]
+		mj.ghostTips2 = ghost[1]
 	}
-	return false
+}
+
+// 判断是否是鬼牌
+func (mj *MJTing) isGhost(cid int) bool {
+	return cid == mj.ghostTips1 || cid == mj.ghostTips2
 }
 
 // 设置手牌cidList
 func (mj *MJTing) setHandCards(cards []int) {
-	mj.checkCards = make([]int, 0)
 	mj.ghostNum = 0
+	mj.handCards = make([]int, 0)
 	for _, cid := range cards {
 		if cid == 0 {
 			continue
@@ -69,13 +106,11 @@ func (mj *MJTing) setHandCards(cards []int) {
 			mj.ghostNum++
 			continue
 		}
-		mj.checkCards = append(mj.checkCards, cid)
 		mj.handCards = append(mj.handCards, cid)
 	}
-	mj.checkCards = append(mj.checkCards, mj.fuuroList...)
 }
 
-// 设置无鬼加倍
+// 设置无鬼加倍倍数
 func (mj *MJTing) setNoGhostMulti() {
 	configNoGhostMulti := mj.ruleConfig.NoneGhostMultiple
 	if configNoGhostMulti != 0 && mj.ghostNum == 0 {
@@ -83,35 +118,7 @@ func (mj *MJTing) setNoGhostMulti() {
 	}
 }
 
-func (mj *MJTing) checkCidValid(cid int) bool {
-	deskConfig := mj.ruleConfig
-	if deskConfig == nil {
-		return false
-	}
-	if cid%10 == 0 {
-		return false
-	}
-	if cid < 10 {
-		return deskConfig.HasMan
-	}
-	if cid < 20 {
-		return deskConfig.HasPin
-	}
-	if cid < 30 {
-		return deskConfig.HasSou
-	}
-	if cid < 38 {
-		if deskConfig.HasHonors {
-			return true
-		}
-		if deskConfig.Category == config.CATEGORY_RED_DRAGON {
-			// 没有字牌但如果是红中王，则必须有红中和白板
-			return cid == 37 || cid == 35
-		}
-	}
-	return false
-}
-
+// 获取指定番型分值
 func (mj *MJTing) getSupportFanPoint(fanType int) int {
 	for index := range *mj.supportFanList {
 		tmpFan := (*mj.supportFanList)[index]
@@ -122,74 +129,65 @@ func (mj *MJTing) getSupportFanPoint(fanType int) int {
 	return 0
 }
 
+// 查看是否是四鬼胡牌
 func (mj *MJTing) setFourGhostWinTing() {
-	// 不支持四鬼胡牌
+	// 不支持死鬼胡牌或者鬼牌数量小于四
 	if mj.ghostNum < 4 || !mj.ruleConfig.FourGhostWin {
 		return
 	}
 
-	fourGhostPoint := mj.getSupportFanPoint(config.FourGhost)
-	if 13 == len(mj.checkCards)+mj.ghostNum {
-		mj.FourGhostWinMap[0] = fourGhostPoint
-		return
-	}
-
-	for index := range mj.checkCards {
-		cid := mj.checkCards[index]
-		if cid%10 == 0 || mj.isGhost(cid) {
-			continue
-		}
-		mj.FourGhostWinMap[cid] = fourGhostPoint
-	}
-
+	// 分值
+	mj.FourGhostWinPoint = mj.getSupportFanPoint(config.FourGhost)
 }
 
 // 用当前手牌cidList 开始查询
 func (mj *MJTing) FindCurHandCardTingInfo() {
-	handLintCount := len(mj.checkCards)
-	if 13 == handLintCount+mj.ghostNum {
-		mjTurn := &MJTingTurn{}
-		mjTurn.Init(0, mj.checkCards, mj.handCards, mj)
-		mjTurn.findCurHandCardTingInfo()
-		if len(mjTurn.finalResult) == 0 {
-			return
-		}
-		mj.NormalResultMap[0] = mjTurn.finalResult
-		return
-	}
-
 	alreadyPut := make(map[int]bool)
-	for index := range mj.fuuroList {
-		flag := true
-		for hCardIndex := range mj.handCards {
-			if mj.handCards[hCardIndex] == mj.fuuroList[index] {
-				flag = false
-				break
+
+	findMaxMulti := func(tmpRMap map[int]int) int {
+		maxMulti := 0
+		for _, tmpMulti := range tmpRMap {
+			if tmpMulti > maxMulti {
+				maxMulti = tmpMulti
 			}
 		}
-		if flag {
-			alreadyPut[mj.fuuroList[index]] = true
-		}
+		return maxMulti
 	}
 
-	for index := range mj.checkCards {
-		tmpCardCid := mj.checkCards[index]
+	for i := 0; i <= len(mj.handCards)-1; i++ {
+		tmpCardCid := mj.handCards[i]
 
 		if _, ok := alreadyPut[tmpCardCid]; ok {
 			continue
 		}
 		alreadyPut[tmpCardCid] = true
 
-		copyHandCards := make([]int, len(mj.checkCards))
-		copy(copyHandCards, mj.checkCards)
+		copyHandCards := make([]int, len(mj.handCards))
+		copy(copyHandCards, mj.handCards)
 
 		mjTurn := &MJTingTurn{}
-		mjTurn.Init(tmpCardCid, append(copyHandCards[:index], copyHandCards[index+1:]...), mj.handCards, mj)
+		mjTurn.Init(tmpCardCid, append(copyHandCards[:i], copyHandCards[i+1:]...), mj.fuuroList, mj)
+
 		mjTurn.findCurHandCardTingInfo()
 		if len(mjTurn.finalResult) == 0 {
 			continue
 		}
+
+		maxMulti := findMaxMulti(mjTurn.finalResult)
+		findMaxMulti(mjTurn.finalResult)
+		if mj.ghostTips1 != 0 {
+			mjTurn.finalResult[mj.ghostTips1] = maxMulti
+		}
+
+		if mj.ghostTips2 != 0 {
+			mjTurn.finalResult[mj.ghostTips2] = maxMulti
+		}
+
 		mj.NormalResultMap[tmpCardCid] = mjTurn.finalResult
+
+		if 0 == tmpCardCid {
+			return
+		}
 	}
 
 	return
@@ -197,79 +195,126 @@ func (mj *MJTing) FindCurHandCardTingInfo() {
 
 // 一轮查询
 type MJTingTurn struct {
-	Ting              *MJTing
-	putCardId         int              // 打出的牌Id
-	qiduiSyanten      int              // 七对向听数
-	qiduiKongNum      int              // 七对豪华数量
-	qiduiTingList     []int            // 七对听牌列表
-	cardTypeCountMap  map[int]int      // 手牌每种牌数量 {1,4,5,4}
-	cardStrList       []string         // 手牌每种牌字符串形式
-	ghostDistribution [][]int          // 鬼牌分配情况
-	cardCountList     [38]int          // 手牌数量列表
-	queryResult       []map[int]string // 查询结果
-	finalResult       map[int]int      // 最终结果
+	Ting                      *MJTing
+	putCardId                 int              // 打出的牌Id
+	qiduiSyanten              int              // 七对向听数
+	qiduiKongNum              int              // 七对豪华数量
+	qiduiTingList             []int            // 七对听牌列表
+	handCards                 []int            // 手牌list
+	fuuroList                 []int            // 附录list
+	cardTypeCountMapWithFuuro map[int]int      // 手牌每种牌数量 {1,4,5,4}
+	cardStrListWithFuuro      []string         // 手牌每种牌字符串形式
+	cardStrListWithoutFuuro   []string         // 手牌每种牌字符串形式
+	ghostDistribution         [][]int          // 鬼牌分配情况
+	cardCountListWithFuuro    [38]int          // 手牌数量列表
+	cardCountListWithoutFuuro [38]int          // 手牌数量列表
+	queryResult               []map[int]string // 查询结果
+	finalResult               map[int]int      // 最终结果
 }
 
-func (turn *MJTingTurn) Init(cardId int, handCards, checkCards []int, ting *MJTing) {
+func (turn *MJTingTurn) Init(cardId int, handCards []int, fuuroList []int, ting *MJTing) {
 	turn.Reset()
 	turn.putCardId = cardId
 	turn.Ting = ting
+	turn.fuuroList = fuuroList
+	turn.handCards = handCards
 
-	turn.setCardCount(checkCards)
+	turn.setCardCount()
 	turn.setCardStrList()
 	turn.distributeGhost(turn.Ting.ghostNum+1, false, 0, []int{0, 0, 0, 0})
-	turn.calcQiduiziSyanten(handCards)
+	turn.calcQiduiziSyanten()
 }
 
 func (turn *MJTingTurn) Reset() {
 	turn.putCardId = 0
 	turn.qiduiKongNum = 0
 	turn.qiduiSyanten = 0
-	turn.cardTypeCountMap = make(map[int]int)
-	turn.cardStrList = make([]string, 4)
+	turn.cardTypeCountMapWithFuuro = make(map[int]int)
+	turn.cardStrListWithFuuro = make([]string, 4)
+	turn.cardStrListWithoutFuuro = make([]string, 4)
 	turn.ghostDistribution = make([][]int, 0)
-	turn.cardCountList = [38]int{}
+	turn.cardCountListWithFuuro = [38]int{}
+	turn.cardCountListWithoutFuuro = [38]int{}
 	turn.finalResult = make(map[int]int)
 	turn.queryResult = make([]map[int]string, 0)
 	turn.qiduiTingList = make([]int, 0)
 }
 
-func (turn *MJTingTurn) setCardCount(handCards []int) {
-	turn.cardTypeCountMap = make(map[int]int)
-	for _, cid := range handCards {
-		turn.cardCountList[cid] += 1
-		turn.cardTypeCountMap[cid/10] += 1
+//
+func (turn *MJTingTurn) setCardCount() {
+	turn.cardTypeCountMapWithFuuro = make(map[int]int)
+	for _, cid := range append(turn.handCards, turn.fuuroList...) {
+		turn.cardCountListWithFuuro[cid] += 1
+		turn.cardTypeCountMapWithFuuro[cid/10] += 1
+	}
+
+	for _, cid := range turn.handCards {
+		turn.cardCountListWithoutFuuro[cid] += 1
 	}
 }
 
 func (turn *MJTingTurn) setCardStrList() {
-	for i := range turn.cardCountList {
+	for i := range turn.cardCountListWithFuuro {
 		if i%10 == 0 {
 			continue
 		}
-		turn.cardStrList[i/10] += strconv.Itoa(turn.cardCountList[i])
+		turn.cardStrListWithFuuro[i/10] += strconv.Itoa(turn.cardCountListWithFuuro[i])
+	}
+	for i := range turn.cardCountListWithoutFuuro {
+		if i%10 == 0 {
+			continue
+		}
+		turn.cardStrListWithoutFuuro[i/10] += strconv.Itoa(turn.cardCountListWithoutFuuro[i])
 	}
 }
 
-func (turn *MJTingTurn) calcQiduiziSyanten(handCards []int) {
+// 计算七对子向听数和豪华数
+func (turn *MJTingTurn) calcQiduiziSyanten() {
 	cardCountMap := make(map[int]int)
-	for _, cid := range handCards {
+	for _, cid := range turn.handCards {
 		cardCountMap[cid] += 1
 	}
+
+	if len(turn.fuuroList) != 0 {
+		return
+	}
+
+	singleCount := 0
+	realDuiziCoung := 0
 	duiziCount := 0
+	tmpGhostNum := turn.Ting.ghostNum
 	for k, num := range cardCountMap {
 		if num == 4 {
 			duiziCount += 2
 			turn.qiduiKongNum += 1
 			continue
 		}
-		if num >= 2 {
+
+		if num == 3 {
 			duiziCount++
+			if tmpGhostNum >= 0 {
+				turn.qiduiKongNum += 1
+			}
 		}
+
+		if num == 2 {
+			duiziCount++
+			realDuiziCoung += 1
+		}
+
+		if num == 1 {
+			singleCount += 1
+		}
+
 		if num%2 == 1 {
 			turn.qiduiTingList = append(turn.qiduiTingList, k)
+			if tmpGhostNum >= 0 {
+				tmpGhostNum -= 1
+			}
 		}
 	}
+
+	turn.qiduiKongNum += (tmpGhostNum) / 2
 
 	turn.qiduiSyanten = 5 - duiziCount - turn.Ting.ghostNum
 }
@@ -284,10 +329,8 @@ func (turn *MJTingTurn) distributeGhost(remainGhost int, jiangConfirm bool, inde
 	}
 
 	cardCount := 0
-	if _, ok := turn.cardTypeCountMap[index]; ok {
-		cardCount = turn.cardTypeCountMap[index]
-		//turn.distributeGhost(remainGhost, jiangConfirm, index+1, beforeresult)
-		//return
+	if _, ok := turn.cardTypeCountMapWithFuuro[index]; ok {
+		cardCount = turn.cardTypeCountMapWithFuuro[index]
 	}
 
 	for i := 0; i <= remainGhost; i++ {
@@ -319,9 +362,11 @@ func (turn *MJTingTurn) distributeGhost(remainGhost int, jiangConfirm bool, inde
 // 计算听牌列表
 func (turn *MJTingTurn) findCurHandCardTingInfo() {
 	// 七对检测
-	turn.checkQiduizi()
+	//turn.checkQiduizi()
+
 	// 从db查询相应字符串
 	turn.queryStrInDbClient()
+
 	// 转化结果
 	turn.transformResult()
 }
@@ -339,35 +384,75 @@ func (turn *MJTingTurn) checkQiduizi() {
 	}
 
 	if turn.qiduiSyanten <= -1 {
-		point := 0
-		category := int(turn.Ting.category)
-		qiduiMulti := turn.Ting.ruleConfig.SevenPairsMultiple
-		if config.CATEGORY_PUSH_WIN == category {
-			point = qiduiMulti
-		} else if turn.qiduiKongNum == 0 {
-			point = getFanPoint(config.SevenPairs)
-		} else if turn.qiduiKongNum == 1 {
-			point = getFanPoint(config.LuxurySeverPairs)
-		} else if turn.qiduiKongNum == 2 {
-			point = getFanPoint(config.DoubleLuxurySeverPairs)
-		} else if turn.qiduiKongNum == 3 {
-			point = getFanPoint(config.ThreeLuxurySeverPairs)
+		basePoint := 4
+		if turn.Ting.homeType == config.SUB_CATEGORY_FRIEND {
+			basePoint = 2
 		}
 
+		qiduiKongNum := turn.qiduiKongNum
+		category := int(turn.Ting.category)
+		qiduiMulti := turn.Ting.ruleConfig.SevenPairsMultiple
+		if qiduiKongNum > 3 {
+			return
+		}
+		sevenMulti := []int{0, 0, 0, 0}
+
+		sevenMulti[0] = getFanPoint(config.SevenPairs)
+		sevenMulti[1] = getFanPoint(config.LuxurySeverPairs)
+		sevenMulti[2] = getFanPoint(config.DoubleLuxurySeverPairs)
+		sevenMulti[3] = getFanPoint(config.ThreeLuxurySeverPairs)
+
+		noGhostMulti := turn.Ting.noGhostMulti
 		for index := range turn.qiduiTingList {
-			turn.finalResult[turn.qiduiTingList[index]] = point
+			tingCid := turn.qiduiTingList[index]
+
+			if config.CATEGORY_PUSH_WIN == category {
+				turn.finalResult[tingCid] = qiduiMulti * noGhostMulti * basePoint
+				continue
+			}
+
+			turn.finalResult[tingCid] = sevenMulti[qiduiKongNum] * noGhostMulti
 		}
 	}
 }
 
 // 从Redis中查询
 func (turn *MJTingTurn) queryStrInDbClient() {
+
+	reduceUnfitStr := func(src map[int][]string) map[int]string {
+		tmpResultMap2 := make(map[int]string)
+		for key, _ := range src {
+			value := src[key]
+			//if !strings.Contains(value[1], "|2|") && strings.Contains(value[0], "|2|") {
+			//	value[0] = strings.Replace(value[0], "|2|", "|1|", 1)
+			//}
+			for i := 1; i <= 9; i++ {
+				str1 := strconv.Itoa(i) + " "
+				str2 := strconv.Itoa(i) + ","
+				if !strings.Contains(value[0], str1) && !strings.Contains(value[0], str2) {
+					continue
+				}
+				if value[1] == "" {
+					break
+				}
+				if !strings.Contains(value[1], str1) && !strings.Contains(value[1], str2) {
+					value[0] = strings.Replace(value[0], ","+str1, " ", 9)
+					value[0] = strings.Replace(value[0], str1, " ", 9)
+					value[0] = strings.Replace(value[0], str2, "", 9)
+				}
+			}
+
+			tmpResultMap2[key] = value[0]
+		}
+		return tmpResultMap2
+	}
+
 	for _, ghostDis := range turn.ghostDistribution { // 遍历鬼牌分配情况
 		flag := true
-		tmpResultMap := make(map[int]string)
+		tmpResultMap := make(map[int][]string)
 
-		for typeIndex := range turn.cardStrList { // 四种手牌分别查表
-			cardStr := turn.cardStrList[typeIndex]
+		for typeIndex := range turn.cardStrListWithFuuro { // 四种手牌分别查表
+			cardStr := turn.cardStrListWithFuuro[typeIndex]
 
 			ghostCount := ghostDis[typeIndex]
 			if (cardStr == "000000000" || cardStr == "0000000") && ghostCount == 0 {
@@ -380,34 +465,65 @@ func (turn *MJTingTurn) queryStrInDbClient() {
 			}
 
 			key += strconv.Itoa(ghostCount)
+			realKey := fmt.Sprintf("%s:%s", key, cardStr)
 
-			findResult := turn.Ting.redisClient.HGet(key, cardStr)
-			fan, err := findResult.Result()
-			if err != nil {
+			fan, err := turn.Ting.redisClient.Get(realKey).Result()
+			if err != nil || fan == "" {
 				flag = false
 				break
 			}
 
-			tmpResultMap[typeIndex] = fan
+			fan2 := ""
+			cardStrWithoutFuuro := turn.cardStrListWithoutFuuro[typeIndex]
+			realKey = fmt.Sprintf("%s:%s", key, cardStrWithoutFuuro)
+			if cardStrWithoutFuuro != cardStr {
+				fan2, err = turn.Ting.redisClient.Get(realKey).Result()
+				if err != nil {
+					flag = false
+					break
+				}
+			}
+
+			tmpResultMap[typeIndex] = []string{fan, fan2}
 		}
 
 		if flag {
-			turn.queryResult = append(turn.queryResult, tmpResultMap)
+			turn.queryResult = append(turn.queryResult, reduceUnfitStr(tmpResultMap))
 		}
 	}
 }
 
-// 分析番型string是否符合指定i的番，若符合则返回听的牌
-func (turn *MJTingTurn) analyzeFan(fanType int, fanMap map[int]string) (map[int]byte, int) {
-	tmpMap := make(map[int]byte)
+// 分析番型string是否符合指定的番，若符合则返回听的牌
+func (turn *MJTingTurn) analyzeFan(fanType int, fanMap map[int]string) ([]int, int) {
+	tmpMap := make([]int, 0)
 	tmpFlag := 0
 	tag := "|" + strconv.Itoa(fanType) + "|"
+
+	splitTingList := func(key int, str string) {
+		for _, v := range strings.Split(str, ",") {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				continue
+			}
+			cid := key*10 + n
+			if cid%10 != 0 {
+				tmpMap = append(tmpMap, cid)
+			}
+		}
+	}
+
 	for key, lineValue := range fanMap { //  当前所有种类的手牌
-		if !strings.Contains(lineValue, tag) {
-			break
+		if strings.Contains(lineValue, tag) {
+			tmpFlag++
+		} else if fanType == config.GreatWinds || fanType == config.GreatDragons || fanType == config.LittleWinds || fanType == config.LittleDragons {
+			allFan := strings.Split(lineValue, " ")
+			for index := range allFan {
+				tmpTingStr := allFan[index]
+				index := strings.LastIndex(tmpTingStr, "|")
+				splitTingList(key, tmpTingStr[index+1:])
+			}
 		}
 
-		tmpFlag++
 		num := strings.Split(lineValue, tag)
 		if len(num) < 2 {
 			continue
@@ -415,30 +531,22 @@ func (turn *MJTingTurn) analyzeFan(fanType int, fanMap map[int]string) (map[int]
 
 		fanNum := num[1]
 		numIndex := strings.Index(fanNum, " ")
-		numStr := fanNum[:numIndex]
-		if numStr == "" {
-			//tmpMap = append(tmpMap, key*10)
+		if -1 == numIndex {
 			continue
 		}
-		for _, v := range strings.Split(numStr, ",") {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				continue
-			}
-			cid := key*10 + n
-			if turn.Ting.checkCidValid(cid) {
-				tmpMap[cid] = 1
-			}
+		numStr := fanNum[:numIndex]
+		if numStr == "" {
+			continue
 		}
+		splitTingList(key, numStr)
 	}
 	return tmpMap, tmpFlag
 }
 
 // 检查番型
-func (turn *MJTingTurn) checkFan(index int) (int, map[int]byte) {
+func (turn *MJTingTurn) checkFan(index int) map[int]int {
 	// 最大番型和听牌列表
-	maxFan := 0
-	fanTing := make(map[int]byte)
+	fanTing := make(map[int]int)
 
 	oneQueryMap := turn.queryResult[index]
 	lenOfMap := len(oneQueryMap)
@@ -446,7 +554,24 @@ func (turn *MJTingTurn) checkFan(index int) (int, map[int]byte) {
 	_, hasHonors := oneQueryMap[3]
 	noGhostMulti := turn.Ting.noGhostMulti
 	category := int(turn.Ting.category)
-	qiduiMulti := turn.Ting.ruleConfig.SevenPairsMultiple
+
+	basePoint := 4
+	if turn.Ting.homeType == config.SUB_CATEGORY_FRIEND {
+		basePoint = 2
+	}
+
+	addToFanMap := func(tmpList []int, fanType int) {
+		for index := range tmpList {
+			cid := tmpList[index]
+			if _, ok := fanTing[cid]; !ok {
+				fanTing[cid] = fanType
+				continue
+			}
+			if fanType > fanTing[cid] {
+				fanTing[cid] = fanType
+			}
+		}
+	}
 
 	for _, value := range *turn.Ting.supportFanList {
 		fanType := int(value.FanType)
@@ -455,43 +580,39 @@ func (turn *MJTingTurn) checkFan(index int) (int, map[int]byte) {
 			continue
 		}
 
-		// 推倒胡默认两倍
+		// 推倒胡分值
 		if config.CATEGORY_PUSH_WIN == category {
-			point = qiduiMulti
+			point = basePoint * noGhostMulti
 		}
 
-		tmpMap, tmpFlag := turn.analyzeFan(fanType, oneQueryMap)
+		tmpList, tmpFlag := turn.analyzeFan(fanType, oneQueryMap)
 
-		if (fanType == config.AllHonors || fanType == config.GreatWinds || fanType == config.GreatDragons || fanType == config.LittleWinds ||
-			fanType == config.LittleDragons || fanType == config.PureOneSuit || fanType == config.PurePong) && lenOfMap == 1 && tmpFlag == 1 { // 一个成立
-			if fanType > maxFan {
-				maxFan = point
-				fanTing = tmpMap
-			}
-		} else if (fanType == config.MixedOneSuit || fanType == config.MixedPong) &&
-			lenOfMap == 2 && tmpFlag == 2 && hasHonors { // 两个成立
-			if fanType > maxFan {
-				maxFan = point
-				fanTing = tmpMap
-			}
-		} else if tmpFlag == lenOfMap && tmpFlag != 0 && fanType != 5 && fanType != 8 { // 多个成立
-			if fanType > maxFan {
-				maxFan = point
-				fanTing = tmpMap
-			}
+		if (fanType == config.AllHonors || fanType == config.PureOneSuit || fanType == config.PurePong) && tmpFlag == 1 { // 一个成立
+			addToFanMap(tmpList, point)
+		} else if (fanType == config.GreatWinds || fanType == config.GreatDragons || fanType == config.LittleWinds || fanType == config.LittleDragons) && tmpFlag != 0 && hasHonors {
+			addToFanMap(tmpList, point)
+		} else if (fanType == config.MixedOneSuit || fanType == config.MixedPong) && lenOfMap == 2 && tmpFlag == 2 && hasHonors { // 两个成立
+			addToFanMap(tmpList, point)
+		} else if tmpFlag == lenOfMap && tmpFlag != 0 && fanType != config.MixedOneSuit && fanType != config.MixedPong { // 多个成立
+			addToFanMap(tmpList, point)
 		}
 	}
-	return maxFan, fanTing
+	return fanTing
 }
 
 func (turn *MJTingTurn) transformResult() {
 	// 遍历查询结果
 	for index := range turn.queryResult {
-		maxFan, tmpResult := turn.checkFan(index)
+		tmpResult := turn.checkFan(index)
 
-		for cid := range tmpResult {
-			if maxFan > turn.finalResult[cid] {
-				turn.finalResult[cid] = maxFan
+		for cid, fan := range tmpResult {
+			mFan, ok := turn.finalResult[cid]
+			if !ok {
+				turn.finalResult[cid] = fan
+				continue
+			}
+			if fan > mFan {
+				turn.finalResult[cid] = fan
 			}
 		}
 	}
